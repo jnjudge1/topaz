@@ -3,14 +3,17 @@ package edge
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aserto-dev/go-aserto/client"
 	"github.com/aserto-dev/go-edge-ds/pkg/datasync"
 	"github.com/aserto-dev/go-edge-ds/pkg/directory"
 	"github.com/aserto-dev/go-grpc/aserto/api/v2"
+	"github.com/aserto-dev/topaz/pkg/app"
 	topaz "github.com/aserto-dev/topaz/pkg/cc/config"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/google/uuid"
 	"github.com/open-policy-agent/opa/plugins"
@@ -41,16 +44,19 @@ type Config struct {
 }
 
 type Plugin struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	manager     *plugins.Manager
-	logger      *zerolog.Logger
-	config      *Config
-	topazConfig *topaz.Config
-	syncNow     chan api.SyncMode
+	ctx            context.Context
+	cancel         context.CancelFunc
+	manager        *plugins.Manager
+	logger         *zerolog.Logger
+	config         *Config
+	topazConfig    *topaz.Config
+	syncNow        chan api.SyncMode
+	firstRunSignal chan struct{}
+	once           sync.Once
+	app            *app.Topaz
 }
 
-func newEdgePlugin(logger *zerolog.Logger, cfg *Config, topazConfig *topaz.Config, manager *plugins.Manager) *Plugin {
+func newEdgePlugin(logger *zerolog.Logger, cfg *Config, topazConfig *topaz.Config, manager *plugins.Manager, app *app.Topaz) *Plugin {
 	newLogger := logger.With().Str("component", "edge.plugin").Logger()
 
 	cfg.SessionID = uuid.NewString()
@@ -69,7 +75,8 @@ func newEdgePlugin(logger *zerolog.Logger, cfg *Config, topazConfig *topaz.Confi
 		manager:     manager,
 		config:      cfg,
 		topazConfig: topazConfig,
-		syncNow:     make(chan api.SyncMode),
+		once:        sync.Once{},
+		app:         app,
 	}
 }
 
@@ -79,7 +86,6 @@ func (p *Plugin) resetContext() {
 
 func (p *Plugin) Start(ctx context.Context) error {
 	p.logger.Info().Str("id", p.manager.ID).Bool("enabled", p.config.Enabled).Int("interval", p.config.SyncInterval).Msg("EdgePlugin.Start")
-
 	p.manager.UpdatePluginStatus(PluginName, &plugins.Status{State: plugins.StateOK})
 
 	if p.hasLoopBack() {
@@ -233,11 +239,14 @@ func (p *Plugin) task(mode api.SyncMode) {
 		p.logger.Error().Err(err).Msg(syncTask)
 		return
 	}
-
 	if err := ds.DataSyncClient().Sync(ctx, conn, opts...); err != nil {
 		p.logger.Error().Err(err).Msg(syncTask)
 	}
-
+	if p.config.Enabled {
+		p.once.Do(func() {
+			p.app.SetServiceStatus("sync", grpc_health_v1.HealthCheckResponse_SERVING)
+		})
+	}
 	p.logger.Info().Str(status, finished).Msg(syncTask)
 }
 
@@ -262,4 +271,8 @@ func (p *Plugin) remoteDirectoryClient(ctx context.Context) (*grpc.ClientConn, e
 	}
 
 	return conn, nil
+}
+
+func (p *Plugin) GetFirstRunChan() chan struct{} {
+	return p.firstRunSignal
 }
